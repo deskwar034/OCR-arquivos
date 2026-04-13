@@ -1,6 +1,2 @@
 streamlit
-pytesseract
-PyMuPDF
-Pillow
-requests
-beautifulsoup4
+ocrmypdf
