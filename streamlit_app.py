@@ -6,9 +6,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
+from collections import deque
 from pathlib import Path
 from typing import Iterable
+
 
 import streamlit as st
 
@@ -16,14 +19,21 @@ import streamlit as st
 SUPPORTED_PDF_EXTS = {".pdf"}
 
 
-def safe_name(name: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]+', "-", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name.rstrip(". ") or "arquivo.pdf"
-
-
 def which(binary: str) -> str | None:
     return shutil.which(binary)
+
+
+def format_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "calculando..."
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
 
 
 def check_environment() -> tuple[bool, str]:
@@ -72,10 +82,14 @@ def iter_pdf_files(root: Path) -> Iterable[Path]:
             yield path
 
 
-def run_ocrmypdf(input_pdf: Path, output_pdf: Path, language: str = "por") -> None:
-    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+def trim_log(lines: list[str], max_lines: int = 800) -> list[str]:
+    if len(lines) <= max_lines:
+        return lines
+    return lines[-max_lines:]
 
-    cmd = [
+
+def build_ocr_command(input_pdf: Path, output_pdf: Path, language: str = "por") -> list[str]:
+    return [
         "ocrmypdf",
         "--redo-ocr",
         "--language",
@@ -90,26 +104,208 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path, language: str = "por") -> No
         "0",
         "--tesseract-timeout",
         "180",
+        "--verbose",
+        "1",
         str(input_pdf),
         str(output_pdf),
     ]
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"OCRmyPDF falhou em '{input_pdf.name}'.\n"
-            f"STDOUT:\n{result.stdout[-2000:]}\n\n"
-            f"STDERR:\n{result.stderr[-4000:]}"
+def extract_page_progress(line: str) -> tuple[int, int] | None:
+    """
+    Tenta detectar progresso por página em linhas do OCRmyPDF/Tesseract.
+    Exemplos que queremos capturar:
+    - "page 3 of 12"
+    - "Page 3/12"
+    """
+    patterns = [
+        r"[Pp]age\s+(\d+)\s+of\s+(\d+)",
+        r"[Pp]age\s+(\d+)\s*/\s*(\d+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, line)
+        if m:
+            current = int(m.group(1))
+            total = int(m.group(2))
+            if total > 0 and 1 <= current <= total:
+                return current, total
+    return None
+
+
+class UILogger:
+    def __init__(self):
+        self.progress = st.progress(0, text="Aguardando início...")
+        self.current_file_box = st.empty()
+        self.summary_box = st.empty()
+        self.metrics_box = st.empty()
+        self.log_box = st.empty()
+
+        self.log_lines: list[str] = []
+        self.completed_times: list[float] = []
+        self.recent_times: deque[float] = deque(maxlen=5)
+
+        self.batch_start: float | None = None
+        self.current_start: float | None = None
+        self.current_idx: int = 0
+        self.total_files: int = 0
+        self.current_file: str = ""
+
+        self.current_page: int | None = None
+        self.current_total_pages: int | None = None
+
+    def start_batch(self, total_files: int) -> None:
+        self.batch_start = time.time()
+        self.total_files = total_files
+        self._render_metrics()
+
+    def start_file(self, filename: str, idx: int, total: int) -> None:
+        self.current_start = time.time()
+        self.current_idx = idx
+        self.total_files = total
+        self.current_file = filename
+        self.current_page = None
+        self.current_total_pages = None
+        self.current_file_box.info(f"Arquivo atual: {filename} ({idx}/{total})")
+        self._render_metrics()
+
+    def finish_file(self, elapsed: float) -> None:
+        self.completed_times.append(elapsed)
+        self.recent_times.append(elapsed)
+        self._render_metrics()
+
+    def add_log(self, message: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        self.log_lines.append(f"[{ts}] {message}")
+        self.log_lines = trim_log(self.log_lines, max_lines=800)
+
+        page_progress = extract_page_progress(message)
+        if page_progress:
+            self.current_page, self.current_total_pages = page_progress
+
+        self.log_box.code("\n".join(self.log_lines), language="text")
+        self._render_metrics()
+
+    def set_progress(self, fraction: float, text: str) -> None:
+        self.progress.progress(max(0.0, min(1.0, fraction)), text=text)
+
+    def update_summary(self, manifest: list[dict], total: int) -> None:
+        ok_count = sum(1 for row in manifest if row["status"] == "ok")
+        err_count = sum(1 for row in manifest if row["status"] == "erro")
+        done = len(manifest)
+        self.summary_box.markdown(
+            f"**Resumo:** {done}/{total} concluídos • "
+            f"**Sucesso:** {ok_count} • **Erros:** {err_count}"
+        )
+        self._render_metrics()
+
+    def estimate_current_file_remaining(self) -> float | None:
+        if self.current_start is None:
+            return None
+
+        elapsed = time.time() - self.current_start
+
+        if self.current_page and self.current_total_pages and self.current_page > 0:
+            avg_per_page = elapsed / self.current_page
+            remaining_pages = max(0, self.current_total_pages - self.current_page)
+            return avg_per_page * remaining_pages
+
+        if self.recent_times:
+            return sum(self.recent_times) / len(self.recent_times)
+
+        return None
+
+    def estimate_batch_remaining(self) -> float | None:
+        done_files = len(self.completed_times)
+
+        current_remaining = self.estimate_current_file_remaining()
+
+        if done_files > 0:
+            avg = sum(self.recent_times) / len(self.recent_times) if self.recent_times else sum(self.completed_times) / len(self.completed_times)
+            remaining_after_current = max(0, self.total_files - self.current_idx) * avg
+            if current_remaining is None:
+                current_remaining = avg
+            return current_remaining + remaining_after_current
+
+        return current_remaining
+
+    def _render_metrics(self) -> None:
+        batch_elapsed = (time.time() - self.batch_start) if self.batch_start else None
+        current_elapsed = (time.time() - self.current_start) if self.current_start else None
+        current_remaining = self.estimate_current_file_remaining()
+        batch_remaining = self.estimate_batch_remaining()
+
+        avg_file = None
+        if self.completed_times:
+            avg_file = sum(self.completed_times) / len(self.completed_times)
+
+        recent_avg = None
+        if self.recent_times:
+            recent_avg = sum(self.recent_times) / len(self.recent_times)
+
+        page_txt = "-"
+        if self.current_page and self.current_total_pages:
+            page_txt = f"{self.current_page}/{self.current_total_pages}"
+
+        self.metrics_box.markdown(
+            "\n".join(
+                [
+                    f"**Tempo decorrido total:** {format_seconds(batch_elapsed)}",
+                    f"**Tempo do arquivo atual:** {format_seconds(current_elapsed)}",
+                    f"**ETA do arquivo atual:** {format_seconds(current_remaining)}",
+                    f"**ETA do lote inteiro:** {format_seconds(batch_remaining)}",
+                    f"**Média por arquivo:** {format_seconds(avg_file)}",
+                    f"**Média móvel (últimos 5):** {format_seconds(recent_avg)}",
+                    f"**Progresso interno do arquivo:** {page_txt}",
+                ]
+            )
         )
 
 
-def process_zip_to_searchable_pdfs(zip_bytes: bytes, progress_callback=None) -> tuple[bytes, list[dict]]:
+def run_ocrmypdf_streaming(
+    input_pdf: Path,
+    output_pdf: Path,
+    log_callback,
+    language: str = "por",
+) -> None:
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = build_ocr_command(input_pdf, output_pdf, language=language)
+
+    log_callback(f"$ {' '.join(cmd)}")
+    log_callback(f"Iniciando OCR: {input_pdf.name}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    assert proc.stdout is not None
+
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip()
+        if line:
+            log_callback(line)
+
+    return_code = proc.wait()
+
+    if return_code != 0:
+        raise RuntimeError(f"OCRmyPDF retornou código {return_code} para '{input_pdf.name}'.")
+
+    if not output_pdf.exists():
+        raise RuntimeError(f"Arquivo de saída não foi criado para '{input_pdf.name}'.")
+
+    log_callback(f"Concluído: {input_pdf.name}")
+
+
+def process_zip_to_searchable_pdfs(
+    zip_bytes: bytes,
+    continue_on_error: bool,
+    ui: UILogger,
+) -> tuple[bytes, list[dict]]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         input_zip = tmp / "entrada.zip"
@@ -120,6 +316,7 @@ def process_zip_to_searchable_pdfs(zip_bytes: bytes, progress_callback=None) -> 
         extracted_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        ui.add_log("Abrindo ZIP enviado...")
         with zipfile.ZipFile(input_zip, "r") as zf:
             zf.extractall(extracted_dir)
 
@@ -127,35 +324,67 @@ def process_zip_to_searchable_pdfs(zip_bytes: bytes, progress_callback=None) -> 
         if not pdf_files:
             raise RuntimeError("Nenhum arquivo PDF foi encontrado dentro do ZIP enviado.")
 
+        ui.add_log(f"PDFs encontrados: {len(pdf_files)}")
+        ui.start_batch(len(pdf_files))
+
         manifest: list[dict] = []
         total = len(pdf_files)
 
         for idx, src in enumerate(pdf_files, start=1):
             rel = src.relative_to(extracted_dir)
             out_path = output_dir / rel
+            started = time.time()
+
+            ui.start_file(str(rel), idx, total)
+            ui.add_log("")
+            ui.add_log("=" * 80)
+            ui.add_log(f"[{idx}/{total}] Processando: {rel}")
+            ui.add_log("=" * 80)
 
             try:
-                run_ocrmypdf(src, out_path, language="por")
+                run_ocrmypdf_streaming(
+                    src,
+                    out_path,
+                    log_callback=ui.add_log,
+                    language="por",
+                )
+
+                elapsed = time.time() - started
                 manifest.append(
                     {
                         "arquivo_origem": str(rel),
                         "arquivo_saida": str(rel),
                         "status": "ok",
                         "erro": "",
+                        "segundos": round(elapsed, 2),
                     }
                 )
+                ui.finish_file(elapsed)
+                ui.add_log(f"Sucesso em {elapsed:.1f}s: {rel}")
             except Exception as exc:
+                elapsed = time.time() - started
                 manifest.append(
                     {
                         "arquivo_origem": str(rel),
                         "arquivo_saida": "",
                         "status": "erro",
                         "erro": str(exc),
+                        "segundos": round(elapsed, 2),
                     }
                 )
+                ui.finish_file(elapsed)
+                ui.add_log(f"ERRO em {elapsed:.1f}s: {rel}")
+                ui.add_log(str(exc))
 
-            if progress_callback:
-                progress_callback(idx, total, str(rel))
+                if not continue_on_error:
+                    raise
+
+            batch_remaining = ui.estimate_batch_remaining()
+            ui.set_progress(
+                fraction=idx / total,
+                text=f"Processando {idx}/{total} • ETA lote: {format_seconds(batch_remaining)}"
+            )
+            ui.update_summary(manifest, total)
 
         ok_count = sum(1 for row in manifest if row["status"] == "ok")
         if ok_count == 0:
@@ -163,11 +392,15 @@ def process_zip_to_searchable_pdfs(zip_bytes: bytes, progress_callback=None) -> 
             raise RuntimeError(f"Nenhum PDF foi processado com sucesso.\n\n{first_error}")
 
         result_zip = tmp / "pdfs_ocr_pesquisaveis.zip"
+        ui.add_log("")
+        ui.add_log("Compactando PDFs processados...")
+
         with zipfile.ZipFile(result_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for file in sorted(output_dir.rglob("*")):
                 if file.is_file() and file.suffix.lower() == ".pdf":
                     zf.write(file, arcname=file.relative_to(output_dir))
 
+        ui.add_log(f"ZIP final criado: {result_zip.name}")
         return result_zip.read_bytes(), manifest
 
 
@@ -179,9 +412,8 @@ st.set_page_config(
 
 st.title("📄 OCR de PDFs pesquisáveis em ZIP")
 st.caption(
-    "Envie um arquivo .zip com PDFs. O app aplica OCR em português usando "
-    "redo-ocr, preservando o texto nativo e tentando reconhecer texto em "
-    "tabelas e imagens."
+    "Envie um arquivo .zip com PDFs. O app aplica OCR em português usando redo-ocr, "
+    "preservando o texto nativo e tentando reconhecer texto em tabelas e imagens."
 )
 
 ok, env_msg = check_environment()
@@ -190,6 +422,12 @@ if ok:
 else:
     st.error(env_msg)
     st.stop()
+
+with st.expander("Configurações", expanded=True):
+    continue_on_error = st.checkbox(
+        "Continuar processando mesmo se um PDF falhar",
+        value=True,
+    )
 
 uploaded = st.file_uploader("Envie o arquivo .zip", type=["zip"])
 
@@ -202,30 +440,30 @@ if uploaded is not None:
     st.info("O ZIP de saída conterá apenas os PDFs processados.")
 
     if st.button("Processar ZIP", type="primary", use_container_width=True):
-        progress = st.progress(0, text="Iniciando...")
-        status_box = st.empty()
-
-        def update_progress(current: int, total: int, filename: str) -> None:
-            fraction = current / total if total else 1.0
-            progress.progress(fraction, text=f"Processando {current}/{total}")
-            status_box.info(f"Arquivo atual: {filename}")
+        ui = UILogger()
+        ui.add_log("Recebido arquivo ZIP do usuário.")
+        ui.add_log(f"Nome: {uploaded.name}")
+        ui.add_log(f"Tamanho: {uploaded.size / (1024 * 1024):.2f} MB")
 
         try:
             result_zip_bytes, manifest = process_zip_to_searchable_pdfs(
                 zip_bytes=uploaded.read(),
-                progress_callback=update_progress,
+                continue_on_error=continue_on_error,
+                ui=ui,
             )
             st.session_state.result_zip_bytes = result_zip_bytes
             st.session_state.manifest = manifest
-            progress.progress(1.0, text="Concluído")
+
             ok_count = sum(1 for row in manifest if row["status"] == "ok")
             err_count = sum(1 for row in manifest if row["status"] == "erro")
-            status_box.success(
-                f"Processamento finalizado. PDFs com sucesso: {ok_count}. Erros: {err_count}."
-            )
+
+            ui.set_progress(1.0, f"Concluído • sucesso: {ok_count} • erros: {err_count}")
+            ui.add_log("")
+            ui.add_log("Processamento finalizado.")
         except Exception as exc:
-            progress.empty()
-            status_box.error(f"Erro durante o processamento: {exc}")
+            ui.add_log("")
+            ui.add_log(f"FALHA GERAL: {exc}")
+            st.error(f"Erro durante o processamento: {exc}")
 
 if st.session_state.result_zip_bytes:
     st.download_button(
@@ -242,9 +480,13 @@ if st.session_state.result_zip_bytes:
     st.write(f"Processados com sucesso: **{ok_count}**")
     st.write(f"Com erro: **{err_count}**")
 
-    with st.expander("Detalhes do processamento", expanded=False):
+    with st.expander("Detalhes por arquivo", expanded=False):
         for row in st.session_state.manifest:
             if row["status"] == "ok":
-                st.write(f"- {row['arquivo_origem']} | status=ok")
+                st.write(
+                    f"- {row['arquivo_origem']} | status=ok | tempo={row['segundos']}s"
+                )
             else:
-                st.write(f"- {row['arquivo_origem']} | status=erro | {row['erro']}")
+                st.write(
+                    f"- {row['arquivo_origem']} | status=erro | tempo={row['segundos']}s | {row['erro']}"
+                )
