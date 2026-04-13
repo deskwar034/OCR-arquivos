@@ -2,6 +2,3 @@ tesseract-ocr
 tesseract-ocr-por
 ghostscript
 qpdf
-pngquant
-jbig2enc
-unpaper
