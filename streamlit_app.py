@@ -16,31 +16,33 @@ import streamlit as st
 SUPPORTED_PDF_EXTS = {".pdf"}
 
 
-def slugify_filename(name: str) -> str:
+def safe_name(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "-", name)
     name = re.sub(r"\s+", " ", name).strip()
-    return name.rstrip(". ") or "arquivo"
+    return name.rstrip(". ") or "arquivo.pdf"
 
 
-def check_binary(name: str) -> str | None:
-    return shutil.which(name)
+def which(binary: str) -> str | None:
+    return shutil.which(binary)
 
 
 def check_environment() -> tuple[bool, str]:
     missing = []
 
     for binary in ["tesseract", "ocrmypdf", "gs", "qpdf"]:
-        if not check_binary(binary):
+        if not which(binary):
             missing.append(binary)
 
     if missing:
         return False, (
             "Dependências ausentes no sistema: " + ", ".join(missing) + ".\n\n"
-            "No Streamlit Cloud, use também um arquivo packages.txt com:\n"
+            "No Streamlit Cloud, use packages.txt com:\n"
             "tesseract-ocr\n"
             "tesseract-ocr-por\n"
             "ghostscript\n"
-            "qpdf"
+            "qpdf\n"
+            "pngquant\n"
+            "unpaper"
         )
 
     try:
@@ -70,16 +72,12 @@ def iter_pdf_files(root: Path) -> Iterable[Path]:
             yield path
 
 
-def run_ocrmypdf(
-    input_pdf: Path,
-    output_pdf: Path,
-    language: str = "por",
-    deskew: bool = True,
-    force_ocr: bool = False,
-    skip_text: bool = True,
-) -> None:
+def run_ocrmypdf(input_pdf: Path, output_pdf: Path, language: str = "por") -> None:
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+
     cmd = [
         "ocrmypdf",
+        "--redo-ocr",
         "--language",
         language,
         "--output-type",
@@ -90,17 +88,11 @@ def run_ocrmypdf(
         "1",
         "--fast-web-view",
         "0",
+        "--tesseract-timeout",
+        "180",
+        str(input_pdf),
+        str(output_pdf),
     ]
-
-    if deskew:
-        cmd.append("--deskew")
-
-    if force_ocr:
-        cmd.append("--force-ocr")
-    elif skip_text:
-        cmd.append("--skip-text")
-
-    cmd.extend([str(input_pdf), str(output_pdf)])
 
     result = subprocess.run(
         cmd,
@@ -112,19 +104,12 @@ def run_ocrmypdf(
     if result.returncode != 0:
         raise RuntimeError(
             f"OCRmyPDF falhou em '{input_pdf.name}'.\n"
-            f"STDOUT: {result.stdout[-1000:]}\n"
-            f"STDERR: {result.stderr[-2000:]}"
+            f"STDOUT:\n{result.stdout[-2000:]}\n\n"
+            f"STDERR:\n{result.stderr[-4000:]}"
         )
 
 
-def process_zip_to_searchable_pdfs(
-    zip_bytes: bytes,
-    language: str = "por",
-    deskew: bool = True,
-    force_ocr: bool = False,
-    skip_text: bool = True,
-    progress_callback=None,
-) -> tuple[bytes, list[dict]]:
+def process_zip_to_searchable_pdfs(zip_bytes: bytes, progress_callback=None) -> tuple[bytes, list[dict]]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         input_zip = tmp / "entrada.zip"
@@ -138,33 +123,23 @@ def process_zip_to_searchable_pdfs(
         with zipfile.ZipFile(input_zip, "r") as zf:
             zf.extractall(extracted_dir)
 
-        pdf_files = list(iter_pdf_files(extracted_dir))
-        manifest: list[dict] = []
+        pdf_files = sorted(iter_pdf_files(extracted_dir), key=lambda p: str(p).lower())
+        if not pdf_files:
+            raise RuntimeError("Nenhum arquivo PDF foi encontrado dentro do ZIP enviado.")
 
+        manifest: list[dict] = []
         total = len(pdf_files)
-        if total == 0:
-            raise RuntimeError("Nenhum arquivo PDF foi encontrado dentro do ZIP.")
 
         for idx, src in enumerate(pdf_files, start=1):
             rel = src.relative_to(extracted_dir)
-            out_name = slugify_filename(str(rel).replace(os.sep, " - "))
-            out_path = output_dir / out_name
+            out_path = output_dir / rel
 
             try:
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                run_ocrmypdf(
-                    input_pdf=src,
-                    output_pdf=out_path,
-                    language=language,
-                    deskew=deskew,
-                    force_ocr=force_ocr,
-                    skip_text=skip_text,
-                )
-
+                run_ocrmypdf(src, out_path, language="por")
                 manifest.append(
                     {
                         "arquivo_origem": str(rel),
-                        "arquivo_saida": out_path.name,
+                        "arquivo_saida": str(rel),
                         "status": "ok",
                         "erro": "",
                     }
@@ -182,35 +157,15 @@ def process_zip_to_searchable_pdfs(
             if progress_callback:
                 progress_callback(idx, total, str(rel))
 
-        manifest_txt = output_dir / "manifesto_processamento.csv"
-        lines = ["arquivo_origem,arquivo_saida,status,erro"]
-        for row in manifest:
-            origem = row["arquivo_origem"].replace('"', '""')
-            saida = row["arquivo_saida"].replace('"', '""')
-            status = row["status"].replace('"', '""')
-            erro = row["erro"].replace('"', '""').replace("\n", " ")
-            lines.append(f'"{origem}","{saida}","{status}","{erro}"')
-        manifest_txt.write_text("\n".join(lines), encoding="utf-8")
+        ok_count = sum(1 for row in manifest if row["status"] == "ok")
+        if ok_count == 0:
+            first_error = next((row["erro"] for row in manifest if row["status"] == "erro"), "Falha desconhecida.")
+            raise RuntimeError(f"Nenhum PDF foi processado com sucesso.\n\n{first_error}")
 
-        readme = output_dir / "README.txt"
-        readme.write_text(
-            "\n".join(
-                [
-                    "Este ZIP contém os PDFs processados com OCR pesquisável.",
-                    "Idioma do OCR: por",
-                    "",
-                    "Arquivos incluídos:",
-                    "- PDFs OCRados",
-                    "- manifesto_processamento.csv",
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-        result_zip = tmp / "resultado_pdfs_ocr.zip"
+        result_zip = tmp / "pdfs_ocr_pesquisaveis.zip"
         with zipfile.ZipFile(result_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for file in sorted(output_dir.rglob("*")):
-                if file.is_file():
+                if file.is_file() and file.suffix.lower() == ".pdf":
                     zf.write(file, arcname=file.relative_to(output_dir))
 
         return result_zip.read_bytes(), manifest
@@ -222,8 +177,12 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title("📄 OCR de PDFs pesquisáveis")
-st.caption("Envie um arquivo .zip com PDFs e o app devolverá um novo .zip com os PDFs pesquisáveis.")
+st.title("📄 OCR de PDFs pesquisáveis em ZIP")
+st.caption(
+    "Envie um arquivo .zip com PDFs. O app aplica OCR em português usando "
+    "redo-ocr, preservando o texto nativo e tentando reconhecer texto em "
+    "tabelas e imagens."
+)
 
 ok, env_msg = check_environment()
 if ok:
@@ -231,17 +190,6 @@ if ok:
 else:
     st.error(env_msg)
     st.stop()
-
-with st.expander("Configurações", expanded=True):
-    deskew = st.checkbox("Corrigir inclinação das páginas", value=True)
-    mode = st.radio(
-        "Modo de OCR",
-        options=["Pular PDFs que já têm texto", "Forçar OCR em todos os PDFs"],
-        index=0,
-    )
-
-    skip_text = mode == "Pular PDFs que já têm texto"
-    force_ocr = mode == "Forçar OCR em todos os PDFs"
 
 uploaded = st.file_uploader("Envie o arquivo .zip", type=["zip"])
 
@@ -251,7 +199,9 @@ if "manifest" not in st.session_state:
     st.session_state.manifest = []
 
 if uploaded is not None:
-    if st.button("Processar PDFs", type="primary", use_container_width=True):
+    st.info("O ZIP de saída conterá apenas os PDFs processados.")
+
+    if st.button("Processar ZIP", type="primary", use_container_width=True):
         progress = st.progress(0, text="Iniciando...")
         status_box = st.empty()
 
@@ -263,16 +213,16 @@ if uploaded is not None:
         try:
             result_zip_bytes, manifest = process_zip_to_searchable_pdfs(
                 zip_bytes=uploaded.read(),
-                language="por",
-                deskew=deskew,
-                force_ocr=force_ocr,
-                skip_text=skip_text,
                 progress_callback=update_progress,
             )
             st.session_state.result_zip_bytes = result_zip_bytes
             st.session_state.manifest = manifest
             progress.progress(1.0, text="Concluído")
-            status_box.success("OCR finalizado com sucesso.")
+            ok_count = sum(1 for row in manifest if row["status"] == "ok")
+            err_count = sum(1 for row in manifest if row["status"] == "erro")
+            status_box.success(
+                f"Processamento finalizado. PDFs com sucesso: {ok_count}. Erros: {err_count}."
+            )
         except Exception as exc:
             progress.empty()
             status_box.error(f"Erro durante o processamento: {exc}")
@@ -294,6 +244,7 @@ if st.session_state.result_zip_bytes:
 
     with st.expander("Detalhes do processamento", expanded=False):
         for row in st.session_state.manifest:
-            st.write(
-                f"- {row['arquivo_origem']} | status={row['status']} | saída={row['arquivo_saida'] or '-'}"
-            )
+            if row["status"] == "ok":
+                st.write(f"- {row['arquivo_origem']} | status=ok")
+            else:
+                st.write(f"- {row['arquivo_origem']} | status=erro | {row['erro']}")
