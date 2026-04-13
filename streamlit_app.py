@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import csv
-import io
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable
 
-import fitz  # PyMuPDF
-from PIL import Image
-import pytesseract
 import streamlit as st
 
 
-SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 SUPPORTED_PDF_EXTS = {".pdf"}
 
 
@@ -27,142 +22,158 @@ def slugify_filename(name: str) -> str:
     return name.rstrip(". ") or "arquivo"
 
 
-def check_tesseract(lang: str = "por") -> tuple[bool, str]:
-    tesseract_path = shutil.which("tesseract")
-    if not tesseract_path:
+def check_binary(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def check_environment() -> tuple[bool, str]:
+    missing = []
+
+    for binary in ["tesseract", "ocrmypdf", "gs", "qpdf"]:
+        if not check_binary(binary):
+            missing.append(binary)
+
+    if missing:
         return False, (
-            "Tesseract não encontrado no ambiente. "
-            "No Streamlit Cloud, adicione um arquivo packages.txt com:\n"
+            "Dependências ausentes no sistema: " + ", ".join(missing) + ".\n\n"
+            "No Streamlit Cloud, use também um arquivo packages.txt com:\n"
             "tesseract-ocr\n"
-            "tesseract-ocr-por"
+            "tesseract-ocr-por\n"
+            "ghostscript\n"
+            "qpdf"
         )
 
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
-
     try:
-        langs = pytesseract.get_languages(config="")
+        out = subprocess.check_output(
+            ["tesseract", "--list-langs"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        langs = {line.strip() for line in out.splitlines() if line.strip()}
     except Exception as exc:
-        return False, f"Não foi possível listar idiomas do Tesseract: {exc}"
+        return False, f"Não foi possível verificar os idiomas do Tesseract: {exc}"
 
-    if lang not in langs:
+    if "por" not in langs:
         return False, (
-            f"O idioma '{lang}' não está instalado no Tesseract. "
+            "O idioma 'por' não está instalado no Tesseract.\n\n"
             "No Streamlit Cloud, adicione em packages.txt:\n"
             "tesseract-ocr\n"
             "tesseract-ocr-por"
         )
 
-    return True, tesseract_path
+    return True, "Ambiente OCR pronto."
 
 
-def iter_supported_files(root: Path) -> Iterable[Path]:
+def iter_pdf_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        ext = path.suffix.lower()
-        if ext in SUPPORTED_PDF_EXTS or ext in SUPPORTED_IMAGE_EXTS:
+        if path.is_file() and path.suffix.lower() in SUPPORTED_PDF_EXTS:
             yield path
 
 
-def ocr_image(image: Image.Image, lang: str = "por", psm: int = 6) -> str:
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    return pytesseract.image_to_string(image, lang=lang, config=f"--psm {psm}")
+def run_ocrmypdf(
+    input_pdf: Path,
+    output_pdf: Path,
+    language: str = "por",
+    deskew: bool = True,
+    force_ocr: bool = False,
+    skip_text: bool = True,
+) -> None:
+    cmd = [
+        "ocrmypdf",
+        "--language",
+        language,
+        "--output-type",
+        "pdf",
+        "--optimize",
+        "0",
+        "--jobs",
+        "1",
+        "--fast-web-view",
+        "0",
+    ]
+
+    if deskew:
+        cmd.append("--deskew")
+
+    if force_ocr:
+        cmd.append("--force-ocr")
+    elif skip_text:
+        cmd.append("--skip-text")
+
+    cmd.extend([str(input_pdf), str(output_pdf)])
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"OCRmyPDF falhou em '{input_pdf.name}'.\n"
+            f"STDOUT: {result.stdout[-1000:]}\n"
+            f"STDERR: {result.stderr[-2000:]}"
+        )
 
 
-def ocr_image_file(path: Path, lang: str = "por", psm: int = 6) -> str:
-    with Image.open(path) as img:
-        return ocr_image(img, lang=lang, psm=psm).strip()
-
-
-def ocr_pdf(path: Path, lang: str = "por", dpi: int = 300, psm: int = 6) -> Tuple[str, int]:
-    text_parts: List[str] = []
-    page_count = 0
-
-    with fitz.open(path) as doc:
-        for i, page in enumerate(doc, start=1):
-            page_count += 1
-            pix = page.get_pixmap(dpi=dpi, alpha=False)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            page_text = ocr_image(img, lang=lang, psm=psm).strip()
-            text_parts.append(f"\n\n===== PÁGINA {i} =====\n\n{page_text}")
-
-    return "".join(text_parts).strip(), page_count
-
-
-def process_zip_bytes(
+def process_zip_to_searchable_pdfs(
     zip_bytes: bytes,
-    lang: str = "por",
-    dpi: int = 300,
-    psm: int = 6,
+    language: str = "por",
+    deskew: bool = True,
+    force_ocr: bool = False,
+    skip_text: bool = True,
     progress_callback=None,
-) -> tuple[bytes, List[dict]]:
+) -> tuple[bytes, list[dict]]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
+        input_zip = tmp / "entrada.zip"
         extracted_dir = tmp / "extraido"
         output_dir = tmp / "saida"
+
+        input_zip.write_bytes(zip_bytes)
         extracted_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        input_zip_path = tmp / "entrada.zip"
-        input_zip_path.write_bytes(zip_bytes)
-
-        with zipfile.ZipFile(input_zip_path, "r") as zf:
+        with zipfile.ZipFile(input_zip, "r") as zf:
             zf.extractall(extracted_dir)
 
-        files = list(iter_supported_files(extracted_dir))
-        manifest_rows: List[dict] = []
+        pdf_files = list(iter_pdf_files(extracted_dir))
+        manifest: list[dict] = []
 
-        total = len(files)
+        total = len(pdf_files)
+        if total == 0:
+            raise RuntimeError("Nenhum arquivo PDF foi encontrado dentro do ZIP.")
 
-        for idx, src in enumerate(files, start=1):
+        for idx, src in enumerate(pdf_files, start=1):
             rel = src.relative_to(extracted_dir)
-            base_name = slugify_filename(str(rel.with_suffix("")).replace(os.sep, " - "))
+            out_name = slugify_filename(str(rel).replace(os.sep, " - "))
+            out_path = output_dir / out_name
 
             try:
-                if src.suffix.lower() in SUPPORTED_PDF_EXTS:
-                    text, pages = ocr_pdf(src, lang=lang, dpi=dpi, psm=psm)
-                    out_name = f"{base_name}.txt"
-                    out_path = output_dir / out_name
-                    out_path.write_text(text, encoding="utf-8")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                run_ocrmypdf(
+                    input_pdf=src,
+                    output_pdf=out_path,
+                    language=language,
+                    deskew=deskew,
+                    force_ocr=force_ocr,
+                    skip_text=skip_text,
+                )
 
-                    manifest_rows.append(
-                        {
-                            "arquivo_origem": str(rel),
-                            "tipo": "pdf",
-                            "unidades_processadas": pages,
-                            "arquivo_saida": out_name,
-                            "status": "ok",
-                            "erro": "",
-                        }
-                    )
-                else:
-                    text = ocr_image_file(src, lang=lang, psm=psm)
-                    out_name = f"{base_name}.txt"
-                    out_path = output_dir / out_name
-                    out_path.write_text(text, encoding="utf-8")
-
-                    manifest_rows.append(
-                        {
-                            "arquivo_origem": str(rel),
-                            "tipo": "imagem",
-                            "unidades_processadas": 1,
-                            "arquivo_saida": out_name,
-                            "status": "ok",
-                            "erro": "",
-                        }
-                    )
-            except Exception as exc:
-                err_name = f"{base_name}.erro.txt"
-                err_path = output_dir / err_name
-                err_path.write_text(str(exc), encoding="utf-8")
-
-                manifest_rows.append(
+                manifest.append(
                     {
                         "arquivo_origem": str(rel),
-                        "tipo": src.suffix.lower().lstrip("."),
-                        "unidades_processadas": 0,
-                        "arquivo_saida": err_name,
+                        "arquivo_saida": out_path.name,
+                        "status": "ok",
+                        "erro": "",
+                    }
+                )
+            except Exception as exc:
+                manifest.append(
+                    {
+                        "arquivo_origem": str(rel),
+                        "arquivo_saida": "",
                         "status": "erro",
                         "erro": str(exc),
                     }
@@ -171,72 +182,76 @@ def process_zip_bytes(
             if progress_callback:
                 progress_callback(idx, total, str(rel))
 
-        manifest_path = output_dir / "manifesto_ocr.csv"
-        with manifest_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "arquivo_origem",
-                    "tipo",
-                    "unidades_processadas",
-                    "arquivo_saida",
-                    "status",
-                    "erro",
-                ],
-            )
-            writer.writeheader()
-            writer.writerows(manifest_rows)
+        manifest_txt = output_dir / "manifesto_processamento.csv"
+        lines = ["arquivo_origem,arquivo_saida,status,erro"]
+        for row in manifest:
+            origem = row["arquivo_origem"].replace('"', '""')
+            saida = row["arquivo_saida"].replace('"', '""')
+            status = row["status"].replace('"', '""')
+            erro = row["erro"].replace('"', '""').replace("\n", " ")
+            lines.append(f'"{origem}","{saida}","{status}","{erro}"')
+        manifest_txt.write_text("\n".join(lines), encoding="utf-8")
 
-        readme_path = output_dir / "README.txt"
-        readme_path.write_text(
+        readme = output_dir / "README.txt"
+        readme.write_text(
             "\n".join(
                 [
-                    "Resultado do OCR em português (Tesseract lang='por').",
+                    "Este ZIP contém os PDFs processados com OCR pesquisável.",
+                    "Idioma do OCR: por",
                     "",
-                    "Conteúdo deste ZIP:",
-                    "- Um arquivo .txt para cada PDF/imagem processado",
-                    "- manifesto_ocr.csv com o status de cada item",
-                    "- arquivos .erro.txt quando algum item falhar",
+                    "Arquivos incluídos:",
+                    "- PDFs OCRados",
+                    "- manifesto_processamento.csv",
                 ]
             ),
             encoding="utf-8",
         )
 
-        result_zip_path = tmp / "resultado_ocr.zip"
-        with zipfile.ZipFile(result_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        result_zip = tmp / "resultado_pdfs_ocr.zip"
+        with zipfile.ZipFile(result_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for file in sorted(output_dir.rglob("*")):
                 if file.is_file():
                     zf.write(file, arcname=file.relative_to(output_dir))
 
-        return result_zip_path.read_bytes(), manifest_rows
+        return result_zip.read_bytes(), manifest
 
 
-st.set_page_config(page_title="OCR de ZIP em pt-BR", page_icon="🧾", layout="centered")
+st.set_page_config(
+    page_title="OCR de PDFs pesquisáveis",
+    page_icon="📄",
+    layout="centered",
+)
 
-st.title("🧾 OCR de arquivos ZIP em português")
-st.caption("Envie um .zip com PDFs e/ou imagens. O app faz OCR em pt-BR e devolve um novo .zip com os textos extraídos.")
+st.title("📄 OCR de PDFs pesquisáveis")
+st.caption("Envie um arquivo .zip com PDFs e o app devolverá um novo .zip com os PDFs pesquisáveis.")
 
-ok, msg = check_tesseract("por")
+ok, env_msg = check_environment()
 if ok:
-    st.success(f"Tesseract OK: {msg}")
+    st.success(env_msg)
 else:
-    st.error(msg)
+    st.error(env_msg)
     st.stop()
 
 with st.expander("Configurações", expanded=True):
-    dpi = st.slider("DPI para PDFs", min_value=150, max_value=400, value=300, step=50)
-    psm = st.selectbox("Modo de segmentação (PSM)", options=[3, 4, 6, 11, 12], index=2)
-    st.caption("PSM 6 costuma funcionar bem para páginas com blocos regulares de texto.")
+    deskew = st.checkbox("Corrigir inclinação das páginas", value=True)
+    mode = st.radio(
+        "Modo de OCR",
+        options=["Pular PDFs que já têm texto", "Forçar OCR em todos os PDFs"],
+        index=0,
+    )
+
+    skip_text = mode == "Pular PDFs que já têm texto"
+    force_ocr = mode == "Forçar OCR em todos os PDFs"
 
 uploaded = st.file_uploader("Envie o arquivo .zip", type=["zip"])
 
 if "result_zip_bytes" not in st.session_state:
     st.session_state.result_zip_bytes = None
-if "manifest_rows" not in st.session_state:
-    st.session_state.manifest_rows = []
+if "manifest" not in st.session_state:
+    st.session_state.manifest = []
 
 if uploaded is not None:
-    if st.button("Processar OCR", type="primary", use_container_width=True):
+    if st.button("Processar PDFs", type="primary", use_container_width=True):
         progress = st.progress(0, text="Iniciando...")
         status_box = st.empty()
 
@@ -246,38 +261,39 @@ if uploaded is not None:
             status_box.info(f"Arquivo atual: {filename}")
 
         try:
-            result_zip_bytes, manifest_rows = process_zip_bytes(
+            result_zip_bytes, manifest = process_zip_to_searchable_pdfs(
                 zip_bytes=uploaded.read(),
-                lang="por",
-                dpi=dpi,
-                psm=psm,
+                language="por",
+                deskew=deskew,
+                force_ocr=force_ocr,
+                skip_text=skip_text,
                 progress_callback=update_progress,
             )
             st.session_state.result_zip_bytes = result_zip_bytes
-            st.session_state.manifest_rows = manifest_rows
+            st.session_state.manifest = manifest
             progress.progress(1.0, text="Concluído")
             status_box.success("OCR finalizado com sucesso.")
         except Exception as exc:
             progress.empty()
-            status_box.error(f"Erro durante o OCR: {exc}")
+            status_box.error(f"Erro durante o processamento: {exc}")
 
 if st.session_state.result_zip_bytes:
     st.download_button(
-        label="📦 Baixar ZIP com OCR",
+        label="📦 Baixar ZIP com PDFs pesquisáveis",
         data=st.session_state.result_zip_bytes,
-        file_name="resultado_ocr.zip",
+        file_name="pdfs_pesquisaveis_ocr.zip",
         mime="application/zip",
         use_container_width=True,
     )
 
-    ok_count = sum(1 for row in st.session_state.manifest_rows if row["status"] == "ok")
-    err_count = sum(1 for row in st.session_state.manifest_rows if row["status"] == "erro")
+    ok_count = sum(1 for row in st.session_state.manifest if row["status"] == "ok")
+    err_count = sum(1 for row in st.session_state.manifest if row["status"] == "erro")
 
     st.write(f"Processados com sucesso: **{ok_count}**")
     st.write(f"Com erro: **{err_count}**")
 
-    with st.expander("Manifesto de processamento", expanded=False):
-        for row in st.session_state.manifest_rows:
+    with st.expander("Detalhes do processamento", expanded=False):
+        for row in st.session_state.manifest:
             st.write(
-                f"- {row['arquivo_origem']} | status={row['status']} | saída={row['arquivo_saida']}"
+                f"- {row['arquivo_origem']} | status={row['status']} | saída={row['arquivo_saida'] or '-'}"
             )
